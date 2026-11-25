@@ -221,9 +221,8 @@ const _: () = assert!(size_of::<Mode>() == 32);
 
 /// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
 /// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
-/// shortcut: not yet the host display's own size by default; make it so
-/// once a title is seen to render for the mode it is given.
+/// Series X on a 1080p set lists a 1080p mode), else the host's own screen
+/// ([`host_screen`]), else 3840x2160.
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
@@ -233,16 +232,29 @@ fn display_size() -> (u32, u32) {
         });
         let size = match asked {
             Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
+            _ => host_screen().unwrap_or((3840, 2160)),
         };
         tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
         size
     })
 }
 
-/// The console's mode list: one 4K mode at 60 Hz (the title looks
-/// for a 120 Hz one to allow 120 Hz frame intervals).
-/// shortcut: fixed mode, not the host display's; report the host's rates if
+/// The host's screen in pixels, as the system reports it: the console lists
+/// the television it is plugged into, and the host's own screen is the
+/// closest thing to one (a Deck's panel is 1280x800; a docked set reports
+/// its own size). Unset for a long time, the default was 3840x2160, which
+/// then made every run without `VICTORY_DISPLAY_MODE` render for a 4K set.
+fn host_screen() -> Option<(u32, u32)> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    // SAFETY: two queries of plain numbers, no pointers.
+    let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    (w >= 640 && h >= 360).then_some((w as u32, h as u32))
+}
+
+/// The console's mode list: one mode, at the size the display reports
+/// ([`display_size`]), at 60 Hz (the title looks for a 120 Hz one to allow
+/// 120 Hz frame intervals).
+/// shortcut: fixed rate, not the host display's; report the host's rates if
 /// a title paces by them.
 extern "system" fn modes(
     _: This,

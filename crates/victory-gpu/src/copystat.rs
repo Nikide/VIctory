@@ -493,6 +493,14 @@ fn memory_map() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_MAP").is_none_or(|v| v != "0"))
 }
 
+/// Memory lines between two walks of the address space: as before, every
+/// sixth line, less often once a walk has shown itself to be slow.
+const LINES_PER_WALK: u64 = 6;
+
+/// The walk is left out while the PC has less than this much memory free
+/// (229 MB was left 49 s before run 93 was killed).
+const MAP_FREE_LEAST: u64 = 512 << 20;
+
 /// Asks which of the pages in `asked` (address, answer) are in physical
 /// memory and adds the bytes each stands for (kind, bytes) to its kind.
 fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, present: &mut [u64; 10]) {
@@ -517,7 +525,8 @@ fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, presen
 
 /// Logs what the process has committed by kind, from a walk of its address
 /// space, and how much of each kind is in physical memory (one page in
-/// sixteen is asked about). The kinds tell the title's own memory from
+/// sixteen is asked about, or in more when the address space is big: see
+/// `QUERIES`). The kinds tell the title's own memory from
 /// ours: the title's heaps and page views lie at console addresses (below
 /// 1 TiB), everything the host allocates lies far above. Run 30, seen
 /// from outside at 18.0 GB private: 4.6 GB the title's heaps, 2.6 GB in
@@ -528,12 +537,24 @@ fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, presen
 /// shortcut: the walk takes about 0.6 s on a thread of its own, and a
 /// query of a region of gigabytes holds up other threads' memory calls
 /// for its length (89 ms for the 6.2 GB pool), so it runs with every
-/// sixth memory line only.
+/// sixth memory line only, and the number of queries it makes is bounded
+/// (`QUERIES`): run 93, with 6.8 GB of views and 5 GB of heaps, spent
+/// 24 s in one walk, a whole frame long, at the moment the system had
+/// 231 MB of commit left.
 fn log_memory_map() {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_WRITECOMBINE,
         VirtualQuery,
     };
+    /// Console addresses lie below this.
+    const HOST: usize = 1 << 40;
+    /// One page asked about stands for this much.
+    const STEP: usize = 64 << 10;
+    /// The most pages one walk asks about. The committed bytes per kind
+    /// are exact whatever this is; the "in memory" bytes are counted one
+    /// page in `step` and the step grows to keep the asks under this
+    /// (an ask costs about 0.1 ms, a TLB-wide working-set lock and all).
+    const QUERIES: usize = 8192;
     const KINDS: [&str; 10] = [
         "the title's heaps (private, console addresses)",
         "views of the title's pages (mapped, console addresses)",
@@ -546,10 +567,6 @@ fn log_memory_map() {
         "files and other mappings at host addresses",
         "programs and libraries",
     ];
-    /// Console addresses lie below this.
-    const HOST: usize = 1 << 40;
-    /// One page asked about stands for this much.
-    const STEP: usize = 64 << 10;
     let started = std::time::Instant::now();
     // Allocation, start, bytes, committed, type, protection.
     type Region = (usize, usize, usize, bool, u32, u32);
@@ -612,17 +629,22 @@ fn log_memory_map() {
     let mut present = [0u64; 10];
     let mut asked: Vec<[usize; 2]> = Vec::with_capacity(4096);
     let mut stands: Vec<(usize, u64)> = Vec::with_capacity(4096);
+    // One page in `step` bytes is asked about, coarse enough for the walk
+    // to ask at most `QUERIES` times in all (the "in memory" figures stay
+    // what they stood for: each ask carries the bytes it stands for).
+    let bytes: usize = regions.iter().filter(|r| r.3).map(|r| r.2).sum();
+    let step = bytes.div_ceil(QUERIES).max(STEP).next_multiple_of(STEP);
     for r in regions.iter().filter(|r| r.3) {
         let k = kind(r);
         committed[k] += r.2 as u64;
         let mut offset = 0;
         while offset < r.2 {
             asked.push([r.1 + offset, 0]);
-            stands.push((k, STEP.min(r.2 - offset) as u64));
+            stands.push((k, step.min(r.2 - offset) as u64));
             if asked.len() == 4096 {
                 in_memory(&mut asked, &mut stands, &mut present);
             }
-            offset += STEP;
+            offset += step;
         }
     }
     if !asked.is_empty() {
@@ -705,9 +727,32 @@ fn log_memory() {
     // sixth line; and what the shader table and the pipeline library keep.
     static LINES: AtomicU64 = AtomicU64::new(0);
     static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if memory_map() && LINES.fetch_add(1, Relaxed) % 6 == 5 && !WALKING.swap(true, Relaxed) {
+    // The walk costs about 50 us a region under Wine (a round trip to the
+    // server for each mapped view): 0.3 s at 48,000 regions early in a run,
+    // 24 s at 156,000 with the machine out of memory (run 93, 231 MB of
+    // commit left, a whole frame long). A walk that took over a second
+    // moves the next one six lines further off, and none is walked while
+    // the PC has under [`MAP_FREE_LEAST`] free: that is when a walk of
+    // seconds costs the run more than its numbers are worth.
+    static EVERY: AtomicU64 = AtomicU64::new(LINES_PER_WALK);
+    let every = EVERY.load(Relaxed).max(1);
+    if memory_map()
+        && LINES.fetch_add(1, Relaxed) % every == every - 1
+        && system_memory().0 > MAP_FREE_LEAST
+        && !WALKING.swap(true, Relaxed)
+    {
         let walk = std::thread::Builder::new().name("victory-memory-map".into()).spawn(|| {
+            let began = std::time::Instant::now();
             log_memory_map();
+            let took = began.elapsed();
+            EVERY.store(
+                if took > std::time::Duration::from_secs(1) {
+                    LINES_PER_WALK * 6
+                } else {
+                    LINES_PER_WALK
+                },
+                Relaxed,
+            );
             WALKING.store(false, Relaxed);
         });
         if walk.is_err() {
