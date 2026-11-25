@@ -1204,38 +1204,85 @@ mod host {
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        /// `VICTORY_KEYS=<seconds>:<key>,…` and `f<frame>:<key>,…`: the first
+        /// kind at those seconds after input starts, the second once the title
+        /// has presented that many frames. Frames are what a world run needs:
+        /// its frames take seconds to minutes, so a key timed in seconds lands
+        /// anywhere (`run86`–`run90`).
+        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>, Vec<(u64, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
+            let mut timed = Vec::new();
+            let mut framed = Vec::new();
+            for entry in list.split(',') {
+                let Some((at, key)) = entry.split_once(':') else {
+                    continue;
                 };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
+                let at = at.trim();
+                let Some(vk) = KEY_NAMES
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(key.trim()))
+                    .map(|&(_, vk)| vk)
+                    .or_else(|| {
+                        let k = key.trim();
+                        (k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric())
+                            .then(|| k.as_bytes()[0].to_ascii_uppercase())
+                    })
+                else {
+                    continue;
+                };
+                if let Some(frame) = at.strip_prefix('f').and_then(|n| n.trim().parse::<u64>().ok())
+                {
+                    framed.push((frame, vk));
+                } else if let Ok(seconds) = at.parse::<f64>()
+                    && let Some(d) = Duration::try_from_secs_f64(seconds).ok()
+                {
+                    timed.push((d, vk));
+                }
+            }
+            (Instant::now(), timed, framed)
         });
-        let (start, keys) = &*SCRIPT;
+        let (start, timed, framed) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut out: Vec<u8> = timed
+            .iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
-            .collect()
+            .collect();
+        // Frame-numbered keys: pressed at the first poll after that frame,
+        // held for 200 ms like the timed ones.
+        if !framed.is_empty() {
+            static PRESSED: std::sync::Mutex<Vec<Option<Instant>>> =
+                std::sync::Mutex::new(Vec::new());
+            let frame = victory_gpu::queue::presented();
+            let mut pressed = PRESSED.lock().unwrap_or_else(|e| e.into_inner());
+            if pressed.len() < framed.len() {
+                pressed.resize(framed.len(), None);
+            }
+            for (i, &(at, vk)) in framed.iter().enumerate() {
+                if frame >= at {
+                    let at = pressed[i].get_or_insert_with(Instant::now);
+                    if at.elapsed() < Duration::from_millis(200) {
+                        out.push(vk);
+                    }
+                }
+            }
+        }
+        out
     }
+
+    /// Virtual-key names `VICTORY_KEYS` takes besides single characters.
+    const KEY_NAMES: [(&str, u8); 10] = [
+        ("Enter", 0x0D),
+        ("Esc", 0x1B),
+        ("Tab", 0x09),
+        ("Back", 0x08),
+        ("Up", 0x26),
+        ("Down", 0x28),
+        ("Left", 0x25),
+        ("Right", 0x27),
+        ("Space", 0x20),
+        ("Delete", 0x2E),
+    ];
 
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {

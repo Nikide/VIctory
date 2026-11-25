@@ -1991,15 +1991,46 @@ pub(crate) fn let_go_idle() {
             return;
         }
         let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-        let idle: Vec<(u64, u64)> = map
+        let eligible = |s: &Arc<Shadow>| {
+            Arc::strong_count(s) == 1 && crate::host::references(&s.buffer) == 1
+        };
+        let mut idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
+                eligible(s)
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)
             .collect();
+        // Past the budget on the copies nothing names, the oldest go too
+        // (`VICTORY_LOOSE_MIB`): the title's streaming outruns the idle rules
+        // on a Deck (run90: 3.4 GB private, 14.4 of 14.8 GB used at the
+        // world's entry).
+        let budget = loose_budget();
+        let mut total: u64 = {
+            let mut seen = std::collections::HashSet::new();
+            map.values()
+                .filter(|s| seen.insert(Arc::as_ptr(s) as usize))
+                .map(|s| s.len)
+                .sum()
+        };
+        if total > budget {
+            let mut rest: Vec<(u64, (u64, u64))> = map
+                .iter()
+                .filter(|(key, s)| eligible(s) && !idle.contains(key))
+                .map(|(key, s)| (s.used.load(Ordering::Relaxed), *key))
+                .collect();
+            rest.sort_unstable();
+            for (_, key) in rest {
+                if total <= budget {
+                    break;
+                }
+                if let Some(s) = map.get(&key) {
+                    total = total.saturating_sub(s.len);
+                }
+                idle.push(key);
+            }
+        }
         idle.into_iter().filter_map(|key| map.remove(&key)).collect()
     };
     if !gone.is_empty() {
@@ -3471,6 +3502,21 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
     windows
         .filter(|&(start, bytes)| start >= cell && start <= step && start + bytes == cell + len)
         .min()
+}
+
+/// Bytes of the copies nothing names that may stay: past it the oldest are
+/// let go whatever their idle time (`VICTORY_LOOSE_MIB`, 1024 by default, at
+/// least 64).
+fn loose_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("VICTORY_LOOSE_MIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1024)
+            .max(64)
+            << 20
+    })
 }
 
 /// Copies of title memory outside buffers, by (start, length).

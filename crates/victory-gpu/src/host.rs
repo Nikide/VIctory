@@ -4068,7 +4068,9 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
-        crate::watch::ask_once_end();
+        if !crate::watch::frame() {
+            crate::watch::ask_once_end();
+        }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -5229,7 +5231,10 @@ impl HostList {
                     work();
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
-                    if matches!(step, Step::Run(_)) {
+                    // With a frame's asking (`VICTORY_ASK_FRAME`) it stands:
+                    // those writes keep last frame's bytes in the copies for
+                    // the rest of the frame, which is what the switch trades.
+                    if matches!(step, Step::Run(_)) && !crate::watch::frame() {
                         crate::watch::ask_once_end();
                     }
                     #[cfg(feature = "diagnostics")]

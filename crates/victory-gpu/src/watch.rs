@@ -168,35 +168,98 @@ pub(crate) fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
 }
 
-/// With [`once`]: asks about `ranges` (everything a submission's lists
-/// refresh) as [`ask_ahead`] does, and lets that asking stand until
-/// [`ask_once_end`].
-pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
-    if !once() {
-        return;
-    }
-    ask_once_end();
-    ask_ahead(ranges);
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
-    if j.ahead.is_empty() {
-        // `ask_ahead` asked nothing (fewer than two ranges).
-        j.asked += 1;
-        j.ahead_asked = j.asked;
-    }
-    // `ask_ahead` leaves a range that lies alone to `writes`, which asks
-    // once per flush: with one asking for the submission that was every
-    // such range asked again at each of its 70 flushes (run 76: 2,300
-    // askings a frame with the switch on, as without it). They are asked
-    // here, once; what is not write-watched stays with `writes`.
+/// Whether one asking stands for a whole frame rather than one submission
+/// (`VICTORY_ASK_FRAME=1`; off by default).
+///
+/// The world declares its 174 MB GPU heap 34 times a frame; asked per
+/// submission, its page tables are walked 34 times (6.2 GB, 5-6 s of the
+/// frame measured here). Asked once a frame, once. What it misses: memory
+/// the title writes after the asking and within the same frame keeps the
+/// bytes from the last frame in the copies that refresh later (a frame of
+/// delay, as the texture budget has), and our own writes are still told to
+/// the journal by [`wrote`].
+pub(crate) fn frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_FRAME").is_some_and(|v| v == "1"))
+}
+
+/// The pieces of `ranges` (page ranges) the asking that stands does not
+/// cover yet, in order.
+fn uncovered(j: &Journal, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut fresh = Vec::new();
     for &(start, end) in ranges {
         if start >= end {
             continue;
         }
-        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
-            j.ahead.push((first, last));
+        let mut pieces = vec![(start / PAGE, end.div_ceil(PAGE))];
+        for &(a, b) in &j.ahead {
+            let mut next = Vec::with_capacity(pieces.len() + 1);
+            for (first, last) in pieces {
+                if last <= a || first >= b {
+                    next.push((first, last));
+                    continue;
+                }
+                if first < a {
+                    next.push((first, a));
+                }
+                if last > b {
+                    next.push((b, last));
+                }
+            }
+            pieces = next;
         }
+        fresh.extend(pieces);
+    }
+    fresh
+}
+
+/// With [`once`]: asks about `ranges` (everything a submission's lists
+/// refresh) as [`ask_ahead`] does, and lets that asking stand until
+/// [`ask_once_end`] — or, with [`frame`], the whole frame.
+pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
+    if !once() {
+        return;
+    }
+    if !frame() {
+        ask_once_end();
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    // With a frame's asking standing, only what it does not cover is asked:
+    // asking a range again would walk its page tables once more.
+    let fresh = if frame() && j.kept {
+        uncovered(j, ranges)
+    } else {
+        ranges.iter().filter(|r| r.0 < r.1).map(|&(a, b)| (a / PAGE, b.div_ceil(PAGE))).collect()
+    };
+    if fresh.is_empty() {
+        return;
+    }
+    j.asked += 1;
+    j.ahead_asked = j.asked;
+    let mut pieces = fresh;
+    pieces.sort_unstable();
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        while k < pieces.len()
+            && pieces[k].0 <= last + AHEAD_GAP
+            && last.max(pieces[k].1) - first <= AHEAD_MAX
+        {
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        if k - i < 2 {
+            // A range that lies alone: `writes` asks per flush otherwise.
+            if ask_kernel(j, first, last) {
+                j.ahead.push((first, last));
+            }
+        } else {
+            ask_run(j, &pieces[i..k]);
+        }
+        i = k;
     }
     j.kept = !j.ahead.is_empty();
 }
