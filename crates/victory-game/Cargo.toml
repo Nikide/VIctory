@@ -13,3 +13,6 @@ zlib-rs.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+victory-shader = { path = "../victory-shader" }

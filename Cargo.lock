@@ -666,6 +666,7 @@ name = "victory-game"
 version = "0.1.0"
 dependencies = [
  "memchr",
+ "victory-shader",
  "zlib-rs",
 ]
 

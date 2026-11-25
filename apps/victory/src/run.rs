@@ -36,6 +36,7 @@ pub fn run(
     // physical memory: run 65's memory map).
     drop(prepared);
     drop(original);
+    apply_title_patches(image.base() as usize);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(
@@ -335,6 +336,97 @@ mod tests {
         });
         other.join().unwrap();
         assert_eq!(*order.lock().unwrap(), [1, 2]);
+    }
+}
+
+/// Patches in the title image, for ProjectScarlett 1.0.2.1, applied only where
+/// the bytes are the ones expected (another build is left alone).
+///
+/// 1-3 are the title's own **hang detector**: a call that takes longer than the
+/// console's limit (the world's first frames here take 8-13 s) jumps to its
+/// assert trap at `+0x23cf683`, which ends the run. The bytes and the technique
+/// come from Palmwave (an XCL fork) by way of PR #1965 of this repository,
+/// where they are what lets a 0.5-0.7 fps world run at all. `VICTORY_PATCH=0`
+/// turns patching off, `VICTORY_PATCH_SKIP=1,2,3` skips some, and
+/// `VICTORY_PATCH=<rva>:<old>=<new>;...` adds one.
+fn apply_title_patches(base: usize) {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn VirtualProtect(
+            address: *const core::ffi::c_void,
+            size: usize,
+            protect: u32,
+            old: *mut u32,
+        ) -> i32;
+    }
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    // (number, rva, expected, new, what)
+    const DEFAULTS: [(u32, usize, &str, &str, &str); 3] = [
+        (1, 0x2215bdc, "732e", "9090", "hang detector"),
+        (2, 0x2215c70, "7404", "9090", "hang detector"),
+        (3, 0x2215d84, "7404", "9090", "hang detector"),
+    ];
+    if std::env::var("VICTORY_PATCH").is_ok_and(|v| v.trim() == "0") {
+        return;
+    }
+    let hex = |s: &str| -> Option<Vec<u8>> {
+        let s = s.trim();
+        (s.len() % 2 == 0).then_some(())?;
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+            .collect()
+    };
+    let skip: Vec<u32> = std::env::var("VICTORY_PATCH_SKIP")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|n| n.trim().parse().ok())
+        .collect();
+    let mut list: Vec<(String, usize, Vec<u8>, Vec<u8>)> = Vec::new();
+    for (n, rva, old, new, what) in DEFAULTS {
+        if !skip.contains(&n) {
+            list.push((format!("{n} ({what})"), rva, hex(old).unwrap(), hex(new).unwrap()));
+        }
+    }
+    for entry in std::env::var("VICTORY_PATCH")
+        .unwrap_or_default()
+        .split(';')
+        .filter(|e| !e.trim().is_empty() && e.trim() != "0")
+    {
+        let parsed = (|| {
+            let (rva, rest) = entry.split_once(':')?;
+            let (old, new) = rest.split_once('=')?;
+            let rva = usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16).ok()?;
+            Some((rva, hex(old)?, hex(new)?))
+        })();
+        match parsed {
+            Some((rva, old, new)) if old.len() == new.len() => {
+                list.push((entry.trim().to_string(), rva, old, new))
+            }
+            _ => println!("patch          ignored (bad syntax): {entry}"),
+        }
+    }
+    for (name, rva, old, new) in list {
+        let at = base + rva;
+        // SAFETY: an address inside the title's image, which we mapped; read and
+        // written only after checking the expected bytes, the page made writable
+        // for the write.
+        unsafe {
+            let here = std::slice::from_raw_parts(at as *const u8, old.len());
+            if here != old.as_slice() {
+                println!("patch          {name}: not applied (bytes differ: another build?)");
+                continue;
+            }
+            let mut prot = 0u32;
+            if VirtualProtect(at as *const _, new.len(), PAGE_EXECUTE_READWRITE, &mut prot) == 0 {
+                println!("patch          {name}: not applied (page protection)");
+                continue;
+            }
+            std::ptr::copy_nonoverlapping(new.as_ptr(), at as *mut u8, new.len());
+            let mut back = 0u32;
+            VirtualProtect(at as *const _, new.len(), prot, &mut back);
+            println!("patch          {name}: applied at +{rva:#x}");
+        }
     }
 }
 
