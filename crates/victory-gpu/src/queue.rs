@@ -828,7 +828,44 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // The console composites at the title's own resolution (GTA VI at
+        // 3840x2160) and hands PresentX a smaller plane (1920x1080) that
+        // nothing fills: show the composed target instead when there is one.
+        let plane_width = unsafe { texture.GetDesc() }.Width as u32;
+        let shown = match crate::compose::take_wider_than(plane_width) {
+            Some((guest, composed)) => {
+                let composed_state = crate::resource::host_transition(guest, COPY_SOURCE)
+                    .map_or(COPY_SOURCE, |(_, b)| b);
+                static ONCE: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        plane = plane_width,
+                        composed = unsafe { composed.GetDesc() }.Width,
+                        "presenting the composed target instead of the plane"
+                    );
+                }
+                let shown = host.present(&composed, composed_state, frame);
+                crate::resource::host_transition(guest, composed_state);
+                crate::compose::remember_presented(guest, &composed);
+                shown
+            }
+            // Nothing drawn since the last present: keep the last picture
+            // that was, instead of a black plane the title hands over while
+            // it loads.
+            None => match crate::compose::last_presented() {
+                Some((guest, last))
+                    if unsafe { last.GetDesc() }.Width as u32 > plane_width =>
+                {
+                    let last_state = crate::resource::host_transition(guest, COPY_SOURCE)
+                        .map_or(COPY_SOURCE, |(_, b)| b);
+                    let shown = host.present(&last, last_state, frame);
+                    crate::resource::host_transition(guest, last_state);
+                    shown
+                }
+                _ => host.present(texture, state, frame),
+            },
+        };
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);

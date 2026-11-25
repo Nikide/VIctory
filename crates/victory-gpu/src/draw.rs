@@ -618,6 +618,10 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
+            // The console composites at the title's own resolution and hands
+            // the display a plane; a plane smaller than the target drawn here
+            // would present black (see `compose`).
+            crate::compose::note(record.resource, texture);
             rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
         }
         self.depth = 0;

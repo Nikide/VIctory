@@ -1,2 +1,11 @@
-[alias]
-xtask = "run --quiet --package xtask --"
+# Local build configuration for this host (Steam Deck): MSVC target through
+# LLVM's lld-link and the Windows SDK/CRT staged by xwin. Not for committing.
+# Not for committing: the -L paths are this host's xwin splat.
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link"
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-L", "/home/deck/.cache/cargo-xwin/xwin/sdk/lib/um/x86_64",
+    "-L", "/home/deck/.cache/cargo-xwin/xwin/crt/lib/x86_64",
+    "-L", "/home/deck/.cache/cargo-xwin/xwin/sdk/lib/ucrt/x86_64",
+]
