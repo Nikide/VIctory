@@ -112,6 +112,17 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if j.kept {
         return;
     }
+    // View memory the guards hold is left to `writes`, which answers it
+    // from the guards ([`known_view`]): the kernel's write watch can only
+    // fail there. Asked here with the others, a run holding such a range
+    // failed, was asked again by halves down to single ranges, failing
+    // each time, and the range then went to `writes` all the same (after
+    // triippywhale d0581a55). `VICTORY_VIEW_ASK=1` asks as before.
+    #[cfg(feature = "diagnostics")]
+    let all = pieces.len();
+    pieces.retain(|&(first, _)| !known_view(first * PAGE));
+    #[cfg(feature = "diagnostics")]
+    AHEAD_VIEWS.fetch_add((all - pieces.len()) as u64, std::sync::atomic::Ordering::Relaxed);
     j.asked += 1;
     j.ahead_asked = j.asked;
     j.ahead.clear();
@@ -151,6 +162,12 @@ fn slow(us: u64) {
     SLOW[2].fetch_max(us, Relaxed);
 }
 
+/// Since the last frame line: ranges of view memory the guards hold that a
+/// submission's askings ahead ([`ask_ahead`], [`ask_once`]) left out. Each
+/// was a kernel asking that failed, or several, before.
+#[cfg(feature = "diagnostics")]
+pub(crate) static AHEAD_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// [`SLOW`], taken.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn slow_asks() -> [u64; 3] {
@@ -189,98 +206,56 @@ pub(crate) fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
 }
 
-/// Whether one asking stands for a whole frame rather than one submission
-/// (`VICTORY_ASK_FRAME=1`; off by default).
-///
-/// The world declares its 174 MB GPU heap 34 times a frame; asked per
-/// submission, its page tables are walked 34 times (6.2 GB, 5-6 s of the
-/// frame measured here). Asked once a frame, once. What it misses: memory
-/// the title writes after the asking and within the same frame keeps the
-/// bytes from the last frame in the copies that refresh later (a frame of
-/// delay, as the texture budget has), and our own writes are still told to
-/// the journal by [`wrote`].
+/// With [`once`]: the asking stands for the whole frame instead of one
+/// submission (`VICTORY_ASK_FRAME=1`; off by default). The world declares
+/// its 174 MB GPU heap 34 times a frame; with the asking kept, its page
+/// tables are walked once a frame instead of 34 times. What it misses:
+/// memory the title writes after the asking keeps the bytes of the last
+/// frame in the copies the later submissions refresh (a frame of delay),
+/// and our own writes are still told to the journal by [`wrote`].
 pub(crate) fn frame() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_FRAME").is_some_and(|v| v == "1"))
 }
 
-/// The pieces of `ranges` (page ranges) the asking that stands does not
-/// cover yet, in order.
-fn uncovered(j: &Journal, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
-    let mut fresh = Vec::new();
-    for &(start, end) in ranges {
-        if start >= end {
-            continue;
-        }
-        let mut pieces = vec![(start / PAGE, end.div_ceil(PAGE))];
-        for &(a, b) in &j.ahead {
-            let mut next = Vec::with_capacity(pieces.len() + 1);
-            for (first, last) in pieces {
-                if last <= a || first >= b {
-                    next.push((first, last));
-                    continue;
-                }
-                if first < a {
-                    next.push((first, a));
-                }
-                if last > b {
-                    next.push((b, last));
-                }
-            }
-            pieces = next;
-        }
-        fresh.extend(pieces);
-    }
-    fresh
-}
-
 /// With [`once`]: asks about `ranges` (everything a submission's lists
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
-/// [`ask_once_end`] — or, with [`frame`], the whole frame.
+/// [`ask_once_end`].
 pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
-    if !frame() {
-        ask_once_end();
-    }
+    ask_once_end();
+    ask_ahead(ranges);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
-    // With a frame's asking standing, only what it does not cover is asked:
-    // asking a range again would walk its page tables once more.
-    let fresh = if frame() && j.kept {
-        uncovered(j, ranges)
-    } else {
-        ranges.iter().filter(|r| r.0 < r.1).map(|&(a, b)| (a / PAGE, b.div_ceil(PAGE))).collect()
-    };
-    if fresh.is_empty() {
-        return;
+    if j.ahead.is_empty() {
+        // `ask_ahead` asked nothing (fewer than two ranges).
+        j.asked += 1;
+        j.ahead_asked = j.asked;
     }
-    j.asked += 1;
-    j.ahead_asked = j.asked;
-    let mut pieces = fresh;
-    pieces.sort_unstable();
-    let mut i = 0;
-    while i < pieces.len() {
-        let first = pieces[i].0;
-        let mut last = pieces[i].1;
-        let mut k = i + 1;
-        while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
-        {
-            last = last.max(pieces[k].1);
-            k += 1;
+    // `ask_ahead` leaves a range that lies alone to `writes`, which asks
+    // once per flush: with one asking for the submission that was every
+    // such range asked again at each of its 70 flushes (run 76: 2,300
+    // askings a frame with the switch on, as without it). They are asked
+    // here, once; what is not write-watched stays with `writes`.
+    for &(start, end) in ranges {
+        if start >= end {
+            continue;
         }
-        if k - i < 2 {
-            // A range that lies alone: `writes` asks per flush otherwise.
-            if ask_kernel(j, first, last) {
-                j.ahead.push((first, last));
-            }
-        } else {
-            ask_run(j, &pieces[i..k]);
+        // View memory the guards hold is not asked about: the asking can
+        // only fail there, one failed kernel call for each such copy at
+        // every submission, and `writes` answers it from the guards
+        // (after triippywhale cc368c7c).
+        if known_view(start) {
+            #[cfg(feature = "diagnostics")]
+            AHEAD_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
         }
-        i = k;
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
+            j.ahead.push((first, last));
+        }
     }
     j.kept = !j.ahead.is_empty();
 }
@@ -314,6 +289,34 @@ pub(crate) fn wrote(at: usize, len: usize) {
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
     }
+}
+
+/// We wrote the 64 KiB page numbered `page` of title memory through a
+/// view of our own (`crate::inplace::write_own`): no guard was opened and
+/// no kernel write-watch bit set, so the journal is told here. The page,
+/// and the same physical page at its other title addresses (`others`,
+/// page numbers), count as written at a new asking, which every host copy
+/// that holds them takes at its next refresh. Returns the asking that had
+/// last found `page` written (0: never) and the new one, for the copy
+/// that wrote to note itself current.
+pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    j.asked += 1;
+    let now = j.asked;
+    // As in [`wrote`]: an asking that stands for a submission, or for a
+    // flush, moves with it, or a copy taking the page at the standing
+    // asking would find it written "later" at every refresh.
+    if j.kept || !j.ahead.is_empty() {
+        j.ahead_asked = now;
+    }
+    let before = j.written.insert(page, now).unwrap_or(0);
+    for &other in others {
+        if other != page {
+            j.written.insert(other, now);
+        }
+    }
+    (before, now)
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -530,7 +533,7 @@ fn known_view(start: usize) -> bool {
     }
     let g = guards();
     let first = start / BLOCK;
-    g.protected.contains(&first) || g.absent.contains(&first)
+    g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
 }
 
 struct Guards {
@@ -545,6 +548,27 @@ struct Guards {
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: BTreeSet<usize>,
+    /// With [`view_known`]: blocks made read-only at least once since the
+    /// runtime last mapped or unmapped them. They are view memory whether
+    /// their guard stands now or a write has opened it.
+    viewed: BTreeSet<usize>,
+}
+
+/// Whether a block once guarded stays known as view memory while its
+/// guard is open (`VICTORY_VIEW_KNOWN=1`; off by default).
+///
+/// A range whose first block the title wrote since the last check has
+/// that block neither read-only nor noted absent, so nothing says it is a
+/// view: the kernel's write watch is asked and fails, and then Windows is
+/// asked what the memory is (`is_view`), a walk of the page tables to the
+/// end of the pages that share the first one's state. In runs 222 and 225
+/// that was 338-450 failed askings a frame and 6.5-7.8 ms a frame of the
+/// submitting thread in `VirtualQuery`. With the switch the block is
+/// remembered from the time it was first made read-only until the runtime
+/// maps or unmaps it ([`title_memory_remapped`]).
+fn view_known() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_KNOWN").is_some_and(|v| v == "1"))
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -552,6 +576,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    viewed: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -573,7 +598,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
         let g = guards();
         let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first)
+        g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
     };
     if !known && !is_view(start, end) {
         return None;
@@ -741,6 +766,9 @@ fn protect_alias(g: &mut Guards, block: usize) {
     // SAFETY: title view memory; only its protection changes.
     if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
         g.protected.insert(block);
+        if view_known() {
+            g.viewed.insert(block);
+        }
     }
 }
 
@@ -762,6 +790,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
+        if view_known() {
+            g.viewed.extend(from..to);
+        }
     };
     if set(from, to) {
         note(g, from, to);
@@ -960,14 +991,25 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>, std::time::Instant);
+
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        // From asking for the lock until it is let go (the frame log).
+        crate::framelog::add(crate::framelog::T::RemapUs, self.1.elapsed().as_micros() as u64);
+    }
+}
 
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    let asked = std::time::Instant::now();
+    let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    crate::framelog::add(crate::framelog::T::Remaps, 1);
+    crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
+    Remapping(held, asked)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -1018,6 +1060,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in aliased {
         g.aliased.remove(&block);
     }
+    // What the range shows is new: no longer known to be a view.
+    let viewed: Vec<usize> = g.viewed.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
+    for block in viewed {
+        g.viewed.remove(&block);
+    }
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -1046,6 +1093,7 @@ fn install() {
         if open(&mut g, at, at + 1) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            crate::framelog::add(crate::framelog::T::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
