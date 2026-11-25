@@ -161,7 +161,39 @@ fn make() -> windows::core::Result<Clamp> {
     make_for(device)
 }
 
+/// The clamp shader compiled to DXIL (`cs_6_0`) by `dxc` from [`SOURCE`], its
+/// root signature embedded. Wine's builtin HLSL compiler rejects the
+/// `Interlocked*` methods this shader needs on a byte-address buffer
+/// (`E5005`), which used to leave every indirect execution on the floor.
+static CLAMP_DXIL: &[u8] = include_bytes!("clamp.dxil");
+
+/// The clamp from the embedded DXIL: no compiler at run time.
+fn from_dxil(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    // SAFETY: the blob's own bytes; the root signature is inside it.
+    unsafe {
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, CLAMP_DXIL)?;
+        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: CLAMP_DXIL.as_ptr().cast(),
+                BytecodeLength: CLAMP_DXIL.len(),
+            },
+            ..Default::default()
+        })?;
+        Ok(Clamp { root, pso })
+    }
+}
+
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    match from_dxil(device) {
+        Ok(c) => {
+            tracing::info!("argument clamp: made from the embedded DXIL");
+            return Ok(c);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "argument clamp: the embedded DXIL was refused; compiling the source instead");
+        }
+    }
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -191,6 +223,7 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
             };
             tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
         }
+        tracing::warn!(error = %e, "argument clamp: the system's HLSL compiler refused cs_5_1");
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
@@ -198,15 +231,34 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        tracing::info!(bytes = bytes.len(), "argument clamp: shader compiled");
+        let root: ID3D12RootSignature = match device.CreateRootSignature(0, bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "argument clamp: the root signature inside the shader was refused");
+                if let Some(host) = host() {
+                    host.log_messages();
+                }
+                return Err(e);
+            }
+        };
+        let pso = match device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
                 pShaderBytecode: bytes.as_ptr().cast(),
                 BytecodeLength: bytes.len(),
             },
             ..Default::default()
-        })?;
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "argument clamp: the compute pipeline was refused");
+                if let Some(host) = host() {
+                    host.log_messages();
+                }
+                return Err(e);
+            }
+        };
         Ok(Clamp { root, pso })
     }
 }

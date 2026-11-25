@@ -22,9 +22,23 @@ pub(crate) fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_COMPOSE_FALLBACK").map_or(true, |v| v != "0"))
 }
 
-/// Records a render target drawn this frame, keeping the widest.
+/// Whether this target could be the picture a display would be handed: a
+/// single-mip 16:9 colour target at least 720 lines high. A world in flight
+/// draws into plenty of wider-than-the-plane targets that are not pictures
+/// (square 2048x2048 scratch and shadow maps, for one), and presenting one of
+/// those resizes the swap chain to it and copies resources the host refuses.
+fn shows_a_picture(texture: &ID3D12Resource) -> bool {
+    // SAFETY: a live resource.
+    let desc = unsafe { texture.GetDesc() };
+    let (width, height) = (desc.Width as u32, desc.Height);
+    let aspect = width as f32 / height.max(1) as f32;
+    desc.MipLevels == 1 && height >= 720 && (1.5..=1.95).contains(&aspect)
+}
+
+/// Records a render target drawn this frame, keeping the widest one that could
+/// be the picture.
 pub(crate) fn note(guest: This, texture: &ID3D12Resource) {
-    if !enabled() || guest.is_null() {
+    if !enabled() || guest.is_null() || !shows_a_picture(texture) {
         return;
     }
     // SAFETY: a live resource.

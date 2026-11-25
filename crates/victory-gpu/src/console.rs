@@ -19,10 +19,21 @@ impl Console {
     // shortcut: later system updates gave Series S titles more (amount not
     // published here); the title sizes nothing from this figure
     // (it goes by the device type), so update it if a title does.
-    pub const fn title_memory(self) -> (usize, usize) {
+    pub fn title_memory(self) -> (usize, usize) {
         match self {
             Console::SeriesX => (10 * GIB, 7 * GIB / 2),
-            Console::SeriesS => (0, 7_776 << 20),
+            // `VICTORY_TITLE_MEMORY_MB` overrides the Series S figure for hosts
+            // whose GPU-visible memory cannot hold the title's own demand plus
+            // the copies of it this layer makes (a Steam Deck has 8 GiB).
+            Console::SeriesS => (
+                0,
+                std::env::var("VICTORY_TITLE_MEMORY_MB")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .filter(|&mb| (2048..=16_384).contains(&mb))
+                    .unwrap_or(7_776)
+                    << 20,
+            ),
         }
     }
 
