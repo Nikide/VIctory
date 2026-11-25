@@ -46,6 +46,82 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 
 ### Newest (2026-11-25, later the same day)
 
+**Update, the same night: the first room now renders right on the test
+machine** (walls, textures, people, lamps), at 190 to 450 ms a frame (2 to 5
+frames a second): the picture work has caught up, the frame rate has not.
+What did it, on top of the list below:
+- Descriptor records the title copies into its heap as plain bytes are
+  mirrored before every submission (pull request #305 by Flyander, after
+  upstream VIctory 86a5ed6). Measured here: about 40,000 records a frame
+  that no call had announced; their host slots were empty or stale.
+- A buffer view that does not start on an element of its buffer's host
+  copy gets a copy of its own bytes instead of being refused (after
+  upstream 86a5ed6): 3 to 6 such views a frame.
+- Room on the card is kept for the render targets and buffer copies a
+  world makes in its first frame: 98 buffer copies are made (945 MB) where
+  the runs before made 1, and the processor no longer compares 550 to
+  710 MB a frame looking for shader writes (25 MB now).
+- Levels on demand ran on the card for the first time
+  (`VICTORY_LEVELS_ON_DEMAND=1`, still off by default; with the fixes of
+  pull request #747 by AscilCH): 3.1 GB of the card not allocated for
+  texture levels the title does not hold, no device loss.
+- Guarded blocks under storage writes are opened by default; 14 more
+  shader programs translate; a program is translated with first-half
+  interpolation pairs only if it was refused for one (with that on for
+  every program, 8,551 working pixel programs came out changed).
+- Frame rate, first cuts on the processor side: the descriptor sync uses a
+  cheap fingerprint and leaves draw-table slots to their draws (the pass
+  over the heap went from 70-220 ms a frame to about 3), and memory the
+  guards already hold is not asked of the write watch (pull request #670
+  by Jonirulah). Card copies' pieces can come down inside their own
+  flights (pull request #648 by Jonirulah, `VICTORY_CARD_FETCH_INFLIGHT=1`,
+  off by default: the copy-back thread's wait went from 181 ms a frame to
+  0 here, but the card got busier, so no gain is claimed yet). The frame is
+  still 250 to 380 ms: the card is the limit now, most of it the
+  per-record clamp before each of some 6,700 indirect draws a frame.
+- Pull request #220 (cheaper indirect draws) is IN this tree now, its
+  windows off by default (`VICTORY_INDIRECT_WINDOW=1`). History, so nobody
+  repeats it: with windows on it lost the device three times here. Its own
+  checker (`VICTORY_INDIRECT_WINDOW_CHECK=1`) then showed one list drawing
+  90 records of 2^24 vertices from a window, where the per-draw path lets
+  eight through; a record of 2^23 vertices an instance or more now runs
+  empty. Since that fix: five runs with windows on, no device loss, the
+  card's time per frame roughly halved. One loss after the fix had the
+  in-flight fetch (#648) on as well; do not combine the two. The in-flight
+  fetch itself measured slower here in two runs and stays off.
+- Frame rate, second night (an RTX 4070; the first room went from about
+  3.5-4 to 6-7 frames a second with ALL of the switches below; the
+  defaults are unchanged and give about 4.5-5):
+  - `VICTORY_ASYNC_SUBMIT=1`: submissions are prepared and sent by a
+    thread of the layer, not by the title's render thread, which a
+    profile showed inside the submit path for 257 of 292 ms a frame.
+  - `VICTORY_QUEUE2=1`: fetches of what shaders wrote go to a copy queue
+    (brought back, with the fix for a piece fetched beside a later
+    flight); the copy-back thread's wait fell from about 125 to 7 ms a
+    frame.
+  - `VICTORY_INDIRECT_WINDOW=1`: see above.
+  - `VICTORY_TEXTURE_NO_WAIT=1`: a texture refresh no longer waits while
+    the title remaps memory; the loading phase had 5 readings over a
+    second where it had 18.
+  - `VICTORY_MERGE_GAP=64 VICTORY_MERGE_RUNS=4096`: title bytes put in
+    under flights' shader writes are joined over small gaps (NOT exact:
+    read the comment at `merge_gap` before using it).
+  - On by default: fills of upload memory and read-only buffer copies no
+    longer wait for flights and are checked against what the flights then
+    wrote (`VICTORY_FILL_WAIT=1` waits as before; no mismatch in any run
+    so far); up to 512 idle host lists and texture staging buffers are
+    reused instead of made and freed every frame.
+  - `VICTORY_PROFILE=1` (diagnostics builds): a sampling profiler inside
+    the layer; it is how the above was found.
+  Still open: the frame rate dips (5-second readings of 300-500 ms among
+  150-215); in some of them texture uploads are 3-5 times the usual, in
+  others nothing logged stands out. Not shader compiles (checked: 4-9
+  first uses and no waiting in those readings). A per-frame logger is the
+  next step.
+- Known and counted, not fixed yet: an indirect compute pass asks for
+  about 77,500 thread groups in x where one dispatch runs 65,535 (the
+  rest is cut off).
+
 Memory sync between the title's memory and the copies on the card:
 - **A write through one view of a physical page is seen by the copies taken
   through its other views** (`VICTORY_VIEW_GUARD=0` turns it off). The title
